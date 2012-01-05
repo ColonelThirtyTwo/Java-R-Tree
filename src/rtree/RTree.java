@@ -5,16 +5,25 @@ import java.util.*;
 
 /**
  * 3D R-Tree implementation for minecraft.
- * Uses the quadratic splitting algorithm from: http://www.sai.msu.su/~megera/postgres/gist/papers/Rstar3.pdf
+ * Uses algorithms from: http://www.sai.msu.su/~megera/postgres/gist/papers/Rstar3.pdf
  * @author Colonel32
  */
 public class RTree
 {
+	private Node root;
+	private int maxSize;
+	private int minSize;
+	private NodeSplitter splitter;
+	
 	private class Node implements BoundedObject
 	{
+		Node parent;
+		AABB box;
+		ArrayList<Node> children;
+		ArrayList<BoundedObject> data;
+		
 		public Node()
 		{
-
 		}
 
 		public Node(boolean isLeaf)
@@ -25,11 +34,6 @@ public class RTree
 				children = new ArrayList<Node>(maxSize+1);
 		}
 
-		Node parent;
-		AABB box;
-		ArrayList<Node> children;
-		ArrayList<BoundedObject> data;
-
 		public boolean isLeaf() { return data != null; }
 		public boolean isRoot() { return parent == null; }
 
@@ -39,7 +43,7 @@ public class RTree
 			parent.children.add(this);
 			this.parent = parent;
 			computeMBR();
-			quadSplit(parent);
+			splitter.split(parent);
 		}
 
 		public void computeMBR()
@@ -106,20 +110,246 @@ public class RTree
 			return "Depth: "+depth()+", size: "+size();
 		}
 	}
+	
+	/**
+	 * Node splitting algorithms selectors.
+	 */
+	public enum SplitterType
+	{
+		/**
+		 * Quadratic splitting algorithm. Runs in O(n^2) time where n = maxChildren+1.
+		 * Use this for R-trees that update with new data fairly often.
+		 */
+		QUADRATIC,
+		/**
+		 * NOT IMPLEMENTED.
+		 * Exhaustive splitting algorithm. Runs in O(2^n) time where n = maxChildren+1.
+		 * Produces a more optimized result than the quadratic algorithm
+		 * at the cost of a high runtime. Use this for R-trees that update rarely
+		 * and queried frequently, such as zone protection.
+		 */
+		EXHAUSTIVE,
+	}
+	
+	private interface NodeSplitter
+	{
+		void split(Node n);
+	}
+	
+	private class QuadraticNodeSplitter implements NodeSplitter
+	{
+		public void split(Node n)
+		{
+			if(n.size() <= maxSize) return;
+			boolean isleaf = n.isLeaf();
 
-	private Node root;
-	private int maxSize;
-	private int minSize;
+			// Choose seeds. Would write a function for this, but it requires returning 2 objects
+			BoundedObject seed1 = null, seed2 = null;
+			ArrayList<? extends BoundedObject> list;
+			if(isleaf)
+				list = n.data;
+			else
+				list = n.children;
+
+			int maxD = Integer.MIN_VALUE;
+			AABB box = new AABB();
+			for(int i=0; i<list.size(); i++)
+				for(int j=0; j<list.size(); j++)
+				{
+					if(i == j) continue;
+					BoundedObject n1 = list.get(i), n2 = list.get(j);
+					n1.getBounds().cloneInto(box);
+					box.merge(n2.getBounds());
+					int d = box.getVolume() - n1.getBounds().getVolume() - n2.getBounds().getVolume();
+					if(d > maxD)
+					{
+						maxD = d;
+						seed1 = n1;
+						seed2 = n2;
+					}
+				}
+			assert(seed1 != null && seed2 != null);
+
+			// Distribute
+			Node group1 = new Node(isleaf);
+			group1.box = seed1.getBounds().clone();
+			Node group2 = new Node(isleaf);
+			group2.box = seed2.getBounds().clone();
+			if(isleaf)
+				distributeLeaves(n, group1, group2);
+			else
+				distributeBranches(n, group1, group2);
+
+			Node parent = n.parent;
+			if(parent == null)
+			{
+				parent = new Node(false);
+				root = parent;
+			}
+			else
+				parent.children.remove(n);
+
+			group1.parent = parent;
+			parent.children.add(group1);
+			group1.computeMBR();
+			split(parent);
+
+			group2.parent = parent;
+			parent.children.add(group2);
+			group2.computeMBR();
+			split(parent);
+		}
+		
+		private void distributeBranches(Node n, Node g1, Node g2)
+		{
+			assert(!(n.isLeaf() || g1.isLeaf() || g2.isLeaf()));
+
+			while(!n.children.isEmpty() && g1.children.size() < maxSize - minSize + 1 &&
+					g2.children.size() < maxSize - minSize + 1)
+			{
+				// Pick next
+				int difmax = Integer.MIN_VALUE;
+				int nmax_index = -1;
+				for(int i=0; i<n.children.size(); i++)
+				{
+					Node node = n.children.get(i);
+					int dif = Math.abs(node.box.expansionNeeded(g1.box) - node.box.expansionNeeded(g2.box));
+					if(dif > difmax)
+					{
+						difmax = dif;
+						nmax_index = i;
+					}
+				}
+				assert(nmax_index != -1);
+
+				// Distribute Entry
+				Node nmax = n.children.remove(nmax_index);
+				Node parent = null;
+
+				// ... to the one with the least expansion
+				int overlap1 = nmax.box.expansionNeeded(g1.box);
+				int overlap2 = nmax.box.expansionNeeded(g2.box);
+				if(overlap1 > overlap2) parent = g1;
+				else if(overlap2 > overlap1) parent = g2;
+				else
+				{
+					// Or the one with the lowest volume
+					int vol1 = g1.box.getVolume();
+					int vol2 = g2.box.getVolume();
+					if(vol1 > vol2) parent = g2;
+					else if(vol2 > vol1) parent = g1;
+					else
+					{
+						// Or the one with the least items
+						if(g1.children.size() < g2.children.size()) parent = g1;
+						else parent = g2;
+					}
+				}
+				assert(parent != null);
+				parent.children.add(nmax);
+				nmax.parent = parent;
+			}
+
+			if(!n.children.isEmpty())
+			{
+				Node parent = null;
+				if(g1.children.size() == maxSize - minSize + 1)
+					parent = g2;
+				else
+					parent = g1;
+
+				for(int i=0; i<n.children.size(); i++)
+				{
+					parent.children.add(n.children.get(i));
+					n.children.get(i).parent = parent;
+				}
+				n.children.clear();
+			}
+		}
+		
+		private void distributeLeaves(Node n, Node g1, Node g2)
+		{
+			// Same process as above; just different types.
+			assert(n.isLeaf() && g1.isLeaf() && g2.isLeaf());
+
+			while(!n.data.isEmpty() && g1.data.size() < maxSize - minSize + 1 &&
+					g2.data.size() < maxSize - minSize + 1)
+			{
+				// Pick next
+				int difmax = Integer.MIN_VALUE;
+				int nmax_index = -1;
+				for(int i=0; i<n.data.size(); i++)
+				{
+					BoundedObject node = n.data.get(i);
+					int d1 = node.getBounds().expansionNeeded(g1.box);
+					int d2 = node.getBounds().expansionNeeded(g2.box);
+					int dif = Math.abs(d1 - d2);
+					if(dif > difmax)
+					{
+						difmax = dif;
+						nmax_index = i;
+					}
+				}
+				assert(nmax_index != -1);
+
+				// Distribute Entry
+				BoundedObject nmax = n.data.remove(nmax_index);
+
+				// ... to the one with the least expansion
+				int overlap1 = nmax.getBounds().expansionNeeded(g1.box);
+				int overlap2 = nmax.getBounds().expansionNeeded(g2.box);
+				if(overlap1 > overlap2) g1.data.add(nmax);
+				else if(overlap2 > overlap1) g2.data.add(nmax);
+				else
+				{
+					int vol1 = g1.box.getVolume();
+					int vol2 = g2.box.getVolume();
+					if(vol1 > vol2) g2.data.add(nmax);
+					else if(vol2 > vol1) g1.data.add(nmax);
+					else
+					{
+						if(g1.data.size() < g2.data.size()) g1.data.add(nmax);
+						else g2.data.add(nmax);
+					}
+				}
+			}
+
+			if(!n.data.isEmpty())
+			{
+				if(g1.data.size() == maxSize - minSize + 1)
+					g2.data.addAll(n.data);
+				else
+					g1.data.addAll(n.data);
+				n.data.clear();
+			}
+		}
+	}
 
 	/**
-	 * Constructs an R-Tree.
+	 * Creates an R-Tree. Sets the splitting algorithm to quadratic splitting.
 	 * @param minChildren Minimum children in a node.  {@code 2 <= minChildren <= maxChildren/2}
 	 * @param maxChildren Maximum children in a node. Node splits at this number + 1
 	 */
 	public RTree(int minChildren, int maxChildren)
 	{
+		this(minChildren, maxChildren, SplitterType.QUADRATIC);
+	}
+	
+	public RTree(int minChildren, int maxChildren, SplitterType splittertyp)
+	{
 		if(minChildren < 2 || minChildren > maxChildren/2) throw new IllegalArgumentException("2 <= minChildren <= maxChildren/2");
-
+		
+		switch(splittertyp)
+		{
+			case QUADRATIC:
+				splitter = new QuadraticNodeSplitter();
+				break;
+			case EXHAUSTIVE:
+				throw new UnsupportedOperationException("Not implemented yet.");
+			default:
+				throw new RuntimeException("Invalid node splitter");
+		}
+		
 		this.minSize = minChildren;
 		this.maxSize = maxChildren;
 		root = null;
@@ -251,7 +481,8 @@ public class RTree
 	}
 
 	/**
-	 * Inserts object o into the tree
+	 * Inserts object o into the tree. Note that if the value of o.getAABB() changes
+	 * while in the R-tree, the result is undefined.
 	 * @throws NullPointerException If o == null
 	 */
 	public void insert(BoundedObject o)
@@ -264,7 +495,7 @@ public class RTree
 		assert(n.isLeaf());
 		n.data.add(o);
 		n.computeMBR();
-		quadSplit(n);
+		splitter.split(n);
 	}
 
 	/**
@@ -315,191 +546,4 @@ public class RTree
 			return chooseLeaf(o,maxnode);
 		}
 	}
-
-	private void quadSplit(Node n)
-	{
-		if(n.size() <= maxSize) return;
-		boolean isleaf = n.isLeaf();
-
-		// Choose seeds. Would write a function for this, but it requires returning 2 objects
-		BoundedObject seed1 = null, seed2 = null;
-		ArrayList<? extends BoundedObject> list;
-		if(isleaf)
-			list = n.data;
-		else
-			list = n.children;
-
-		int maxD = Integer.MIN_VALUE;
-		AABB box = new AABB();
-		for(int i=0; i<list.size(); i++)
-			for(int j=0; j<list.size(); j++)
-			{
-				if(i == j) continue;
-				BoundedObject n1 = list.get(i), n2 = list.get(j);
-				n1.getBounds().cloneInto(box);
-				box.merge(n2.getBounds());
-				int d = box.getVolume() - n1.getBounds().getVolume() - n2.getBounds().getVolume();
-				if(d > maxD)
-				{
-					maxD = d;
-					seed1 = n1;
-					seed2 = n2;
-				}
-			}
-		assert(seed1 != null && seed2 != null);
-
-		// Distribute
-		Node group1 = new Node(isleaf);
-		group1.box = seed1.getBounds().clone();
-		Node group2 = new Node(isleaf);
-		group2.box = seed2.getBounds().clone();
-		if(isleaf)
-			distributeLeaves(n, group1, group2);
-		else
-			distributeBranches(n, group1, group2);
-
-		Node parent = n.parent;
-		if(parent == null)
-		{
-			parent = new Node(false);
-			root = parent;
-		}
-		else
-			parent.children.remove(n);
-
-		group1.parent = parent;
-		parent.children.add(group1);
-		group1.computeMBR();
-		quadSplit(parent);
-
-		group2.parent = parent;
-		parent.children.add(group2);
-		group2.computeMBR();
-		quadSplit(parent);
-	}
-
-	private void distributeBranches(Node n, Node g1, Node g2)
-	{
-		assert(!(n.isLeaf() || g1.isLeaf() || g2.isLeaf()));
-
-		while(!n.children.isEmpty() && g1.children.size() < maxSize - minSize + 1 &&
-				g2.children.size() < maxSize - minSize + 1)
-		{
-			// Pick next
-			int difmax = Integer.MIN_VALUE;
-			int nmax_index = -1;
-			for(int i=0; i<n.children.size(); i++)
-			{
-				Node node = n.children.get(i);
-				int dif = Math.abs(node.box.expansionNeeded(g1.box) - node.box.expansionNeeded(g2.box));
-				if(dif > difmax)
-				{
-					difmax = dif;
-					nmax_index = i;
-				}
-			}
-			assert(nmax_index != -1);
-
-			// Distribute Entry
-			Node nmax = n.children.remove(nmax_index);
-			Node parent = null;
-
-			// ... to the one with the least expansion
-			int overlap1 = nmax.box.expansionNeeded(g1.box);
-			int overlap2 = nmax.box.expansionNeeded(g2.box);
-			if(overlap1 > overlap2) parent = g1;
-			else if(overlap2 > overlap1) parent = g2;
-			else
-			{
-				// Or the one with the lowest volume
-				int vol1 = g1.box.getVolume();
-				int vol2 = g2.box.getVolume();
-				if(vol1 > vol2) parent = g2;
-				else if(vol2 > vol1) parent = g1;
-				else
-				{
-					// Or the one with the least items
-					if(g1.children.size() < g2.children.size()) parent = g1;
-					else parent = g2;
-				}
-			}
-			assert(parent != null);
-			parent.children.add(nmax);
-			nmax.parent = parent;
-		}
-
-		if(!n.children.isEmpty())
-		{
-			Node parent = null;
-			if(g1.children.size() == maxSize - minSize + 1)
-				parent = g2;
-			else
-				parent = g1;
-
-			for(int i=0; i<n.children.size(); i++)
-			{
-				parent.children.add(n.children.get(i));
-				n.children.get(i).parent = parent;
-			}
-			n.children.clear();
-		}
-	}
-
-	private void distributeLeaves(Node n, Node g1, Node g2)
-	{
-		// Same process as above; just different types.
-		assert(n.isLeaf() && g1.isLeaf() && g2.isLeaf());
-
-		while(!n.data.isEmpty() && g1.data.size() < maxSize - minSize + 1 &&
-				g2.data.size() < maxSize - minSize + 1)
-		{
-			// Pick next
-			int difmax = Integer.MIN_VALUE;
-			int nmax_index = -1;
-			for(int i=0; i<n.data.size(); i++)
-			{
-				BoundedObject node = n.data.get(i);
-				int d1 = node.getBounds().expansionNeeded(g1.box);
-				int d2 = node.getBounds().expansionNeeded(g2.box);
-				int dif = Math.abs(d1 - d2);
-				if(dif > difmax)
-				{
-					difmax = dif;
-					nmax_index = i;
-				}
-			}
-			assert(nmax_index != -1);
-
-			// Distribute Entry
-			BoundedObject nmax = n.data.remove(nmax_index);
-
-			// ... to the one with the least expansion
-			int overlap1 = nmax.getBounds().expansionNeeded(g1.box);
-			int overlap2 = nmax.getBounds().expansionNeeded(g2.box);
-			if(overlap1 > overlap2) g1.data.add(nmax);
-			else if(overlap2 > overlap1) g2.data.add(nmax);
-			else
-			{
-				int vol1 = g1.box.getVolume();
-				int vol2 = g2.box.getVolume();
-				if(vol1 > vol2) g2.data.add(nmax);
-				else if(vol2 > vol1) g1.data.add(nmax);
-				else
-				{
-					if(g1.data.size() < g2.data.size()) g1.data.add(nmax);
-					else g2.data.add(nmax);
-				}
-			}
-		}
-
-		if(!n.data.isEmpty())
-		{
-			if(g1.data.size() == maxSize - minSize + 1)
-				g2.data.addAll(n.data);
-			else
-				g1.data.addAll(n.data);
-			n.data.clear();
-		}
-	}
 }
-
